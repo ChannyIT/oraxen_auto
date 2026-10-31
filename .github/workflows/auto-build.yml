@@ -1,0 +1,102 @@
+name: Build Latest Oraxen
+
+on:
+  # Hành động 1: Bấm nút "Run workflow" thủ công trong tab Actions
+  workflow_dispatch:
+    inputs:
+      oraxen_ref:
+        description: 'Nhánh, Tag hoặc mã Commit của Oraxen muốn tải về build'
+        required: true
+        default: 'master'
+        type: string
+
+  # Hành động 2: Bấm nút Star (ngôi sao) trên repo của bạn để kích hoạt nhanh
+  watch:
+    types: [started]
+
+  # Hành động 3: Khi bạn push hoặc sửa file bất kỳ trên repo của mình
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-oraxen:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ oraxen/oraxen
+        uses: actions/checkout@v4
+        with:
+          repository: oraxen/oraxen
+          ref: ${{ inputs.oraxen_ref || 'master' }}
+          fetch-depth: 1
+
+      - name: 2. Cài đặt JDK (JDK 21 chạy Gradle Daemon + JDK 25 cho Toolchain)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: |
+            25
+            21
+
+      - name: 3. Kích hoạt bộ nhớ đệm Gradle & Paperweight NMS
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 4. Đọc thông tin phiên bản và Build (reobfJar + shadowJar)
+        id: build_plugin
+        run: |
+          chmod +x gradlew
+
+          # Lấy version chính xác từ file gradle.properties của Oraxen
+          VERSION=$(grep -E '^version\s*=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "full_sha=$FULL_SHA" >> $GITHUB_OUTPUT
+
+          echo "Đang build Oraxen v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          # Chạy task build (bao gồm reobfJar của các module NMS và shadowJar ở root)
+          # Bỏ qua unit test (-x test) để tăng tốc độ và tránh lỗi môi trường giả lập
+          ./gradlew build -x test --no-daemon
+
+          echo "Danh sách file .jar sinh ra tại build/libs/:"
+          ls -lh build/libs/
+
+      - name: 5. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Oraxen-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          # Chỉ lấy file .jar đã đóng gói ở thư mục build/libs gốc, loại bỏ các file phụ
+          path: |
+            build/libs/*.jar
+            !build/libs/*-plain.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-javadoc.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 6. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "Oraxen v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản Oraxen:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.oraxen_ref || 'master' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/oraxen/oraxen/commit/${{ steps.build_plugin.outputs.full_sha }})
+          files: |
+            build/libs/*.jar
+            !build/libs/*-plain.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-javadoc.jar
