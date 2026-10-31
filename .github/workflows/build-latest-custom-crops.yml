@@ -1,0 +1,134 @@
+name: Build Latest Custom-Crops
+
+on:
+  # Hành động 1: Bấm nút "Run workflow" thủ công trong tab Actions
+  workflow_dispatch:
+    inputs:
+      custom_crops_ref:
+        description: 'Nhánh, Tag hoặc mã Commit của Custom-Crops muốn tải về build'
+        required: true
+        default: 'main'
+        type: string
+
+  # Hành động 2: Bấm nút Star (ngôi sao) trên repo của bạn để kích hoạt nhanh
+  watch:
+    types: [started]
+
+  # Hành động 3: Khi bạn push hoặc sửa file bất kỳ trên repo của mình
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-custom-crops:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ Xiao-MoMi/Custom-Crops
+        uses: actions/checkout@v4
+        with:
+          repository: Xiao-MoMi/Custom-Crops
+          ref: ${{ inputs.custom_crops_ref || 'main' }}
+          fetch-depth: 1
+
+      - name: 2. Cài đặt JDK (JDK 21 — toàn bộ module đều dùng toolchain 21)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 3. Kích hoạt bộ nhớ đệm Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 4. Thiết lập thông tin Git (BẮT BUỘC cho build script)
+        run: |
+          # build.gradle.kts của Custom-Crops gọi `git config user.name` lúc Gradle
+          # configure. Nếu user.name chưa được set thì Gradle FAIL với:
+          #   "Process 'command 'git'' finished with non-zero exit value 1"
+          # Lấy đúng tên/email tác giả của commit đang build để trường `builder=`
+          # trong custom-crops.properties khớp với bản build chính thức.
+          git config user.name "$(git log -1 --pretty=%an)"
+          git config user.email "$(git log -1 --pretty=%ae)"
+
+      - name: 5. Vá dependency ItemsAdder (repo maven.devs.beer đã ngừng hoạt động)
+        run: |
+          # Module :compatibility-itemsadder-r2 yêu cầu `dev.lone:api-itemsadder:4.0.9`,
+          # được host tại https://maven.devs.beer/ — repo Maven này đã chết (HTTP 404).
+          # Cùng API đó nay được publish trên Maven Central với group `beer.devs`,
+          # giữ nguyên package dev.lone.itemsadder.api.* và đủ các class
+          # (CustomBlock / CustomFurniture / CustomStack / Events.*).
+          # Dependency này là compileOnly → chỉ dùng lúc biên dịch, KHÔNG được đóng gói
+          # vào file .jar cuối cùng, nên thay đổi này không ảnh hưởng runtime.
+          cat > gradle-init-itemsadder.gradle <<'EOF'
+          allprojects {
+              configurations.all {
+                  resolutionStrategy.dependencySubstitution {
+                      substitute module('dev.lone:api-itemsadder') using module('beer.devs:itemsadder-api:4.0.17')
+                  }
+              }
+          }
+          EOF
+
+      - name: 6. Đọc thông tin phiên bản và Build (reobfJar + shadowJar)
+        id: build_plugin
+        run: |
+          chmod +x gradlew
+
+          # Lấy version chính xác từ file gradle.properties của Custom-Crops
+          VERSION=$(grep -E '^project_version\s*=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Không tìm thấy project_version trong gradle.properties"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Đang build Custom-Crops v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          # Task build của module :plugin sinh ra shadowJar -> target/CustomCrops-<version>.jar
+          # Bỏ qua unit test (-x test) để tăng tốc độ và tránh lỗi môi trường giả lập
+          ./gradlew build -x test --no-daemon --init-script gradle-init-itemsadder.gradle
+
+          echo "Danh sách file .jar sinh ra tại target/:"
+          ls -lh target/
+
+      - name: 7. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomCrops-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          # Chỉ lấy file .jar đã đóng gói ở thư mục target/ gốc, loại bỏ các file phụ
+          path: |
+            target/*.jar
+            !target/*-plain.jar
+            !target/*-dev.jar
+            !target/*-sources.jar
+            !target/*-javadoc.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 8. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "CustomCrops v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản Custom-Crops:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.custom_crops_ref || 'main' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/Xiao-MoMi/Custom-Crops/commit/${{ steps.build_plugin.outputs.full_sha }})
+          files: |
+            target/*.jar
+            !target/*-plain.jar
+            !target/*-dev.jar
+            !target/*-sources.jar
+            !target/*-javadoc.jar
