@@ -79,6 +79,14 @@ jobs:
           # Task buildBukkit = packedJar + verifyBukkitArtifact + toàn bộ check
           # (module :core, :spi và 2 NMS adapter Paperweight v26_2_R1 / v26_3_R1).
           #
+          # --no-parallel là BẮT BUỘC: gradle.properties của Iris bật org.gradle.parallel=true.
+          # Khi chạy song song, task :jar (root) resolve ':adapters:bukkit:nms:v26_2_R1:compileClasspath'
+          # để ProGuard shrink, đồng thời task khác cũng resolve cùng configuration đó →
+          # Gradle 9 abort với:
+          #   "Resolution of the configuration ... was attempted without an exclusive lock."
+          # Đây là bug của build script upstream (upstream CI chỉ build jar modded, không build
+          # đường Bukkit nên không gặp). Đã tái hiện và xác nhận: --no-parallel là fix.
+          #
           # -Dorg.gradle.jvmargs / --max-workers: giống hệt workflow Release của upstream,
           # vì Paperweight decompile + ProGuard shrink rất ngốn RAM.
           # -PuseLocalVolmLib=false: dùng VolmLib master-SNAPSHOT đã publish trên JitPack
@@ -88,7 +96,7 @@ jobs:
           # bằng user root (root bypass quyền read-only nên file vẫn ghi được và test
           # không thể fail như thiết kế). GitHub Actions chạy job bằng user "runner"
           # (không phải root) nên không gặp lỗi này.
-          ./gradlew buildBukkit --no-daemon --max-workers=2 \
+          ./gradlew buildBukkit --no-daemon --no-parallel --max-workers=2 \
             '-Dorg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8' \
             -PuseLocalVolmLib=false
 
