@@ -1,0 +1,127 @@
+name: Build Latest Iris
+
+on:
+  # Hành động 1: Bấm nút "Run workflow" thủ công trong tab Actions
+  workflow_dispatch:
+    inputs:
+      iris_ref:
+        description: 'Nhánh, Tag hoặc mã Commit của Iris muốn tải về build'
+        required: true
+        default: 'master'
+        type: string
+
+  # Hành động 2: Bấm nút Star (ngôi sao) trên repo của bạn để kích hoạt nhanh
+  watch:
+    types: [started]
+
+  # Hành động 3: Khi bạn push hoặc sửa file bất kỳ trên repo của mình
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-iris:
+    runs-on: ubuntu-latest
+    # Iris build Paper NMS adapter (Paperweight decompile) + ProGuard shrink -> rất ngốn RAM và thời gian.
+    # Giống hệt workflow Release chính thức của upstream (timeout-minutes: 120).
+    timeout-minutes: 120
+
+    steps:
+      - name: 1. Clone trực tiếp mã nguồn mới nhất từ VolmitSoftware/Iris
+        uses: actions/checkout@v4
+        with:
+          repository: VolmitSoftware/Iris
+          ref: ${{ inputs.iris_ref || 'master' }}
+          fetch-depth: 1
+
+      - name: 2. Cài đặt JDK 21 (toolchain cho các Minecraft target cũ)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: 3. Cài đặt JDK 25 (BẮT BUỘC — Gradle phải chạy trên Java 25)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '25'
+
+      - name: 4. Kích hoạt bộ nhớ đệm Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: 5. Đọc thông tin phiên bản và Build (packed Bukkit plugin)
+        id: build_plugin
+        run: |
+          chmod +x gradlew
+
+          # Lấy version chính xác từ file gradle.properties của Iris
+          VERSION=$(grep -E '^irisVersion\s*=' gradle.properties | cut -d'=' -f2 | tr -d '[:space:]')
+          SHORT_SHA=$(git rev-parse --short=8 HEAD)
+          FULL_SHA=$(git rev-parse HEAD)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Không tìm thấy irisVersion trong gradle.properties"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Đang build Iris v${VERSION} (Commit: ${SHORT_SHA})..."
+
+          # Task buildBukkit = packedJar + verifyBukkitArtifact + toàn bộ check
+          # (module :core, :spi và 2 NMS adapter Paperweight v26_2_R1 / v26_3_R1).
+          #
+          # -Dorg.gradle.jvmargs / --max-workers: giống hệt workflow Release của upstream,
+          # vì Paperweight decompile + ProGuard shrink rất ngốn RAM.
+          # -PuseLocalVolmLib=false: dùng VolmLib master-SNAPSHOT đã publish trên JitPack
+          # (đúng như tài liệu trong gradle/volmlib-resolution.settings.gradle).
+          #
+          # Lưu ý: nếu build báo lỗi ở test IrisSettingsRewriteFailureTest, đó là do chạy
+          # bằng user root (root bypass quyền read-only nên file vẫn ghi được và test
+          # không thể fail như thiết kế). GitHub Actions chạy job bằng user "runner"
+          # (không phải root) nên không gặp lỗi này.
+          ./gradlew buildBukkit --no-daemon --max-workers=2 \
+            '-Dorg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8' \
+            -PuseLocalVolmLib=false
+
+          echo "Danh sách file .jar sinh ra tại build/libs/:"
+          ls -lh build/libs/
+
+      - name: 6. Tải file .jar chuẩn lên mục Artifacts (Lưu 30 ngày)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Iris-${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          # build/libs/ chứa đúng 1 file: "Iris v<version> [CraftBukkit] <range>.jar"
+          # (task packedJar ghi artifact cuối vào đây; jar thô nằm ở build/tmp/packaging/distribution/)
+          path: |
+            build/libs/*.jar
+            !build/libs/*-plain.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-javadoc.jar
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 7. Tự động xuất bản Release kèm file .jar trong Repo của bạn
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.build_plugin.outputs.version }}-${{ steps.build_plugin.outputs.short_sha }}
+          name: "Iris v${{ steps.build_plugin.outputs.version }} (${{ steps.build_plugin.outputs.short_sha }})"
+          body: |
+            - **Phiên bản Iris:** `${{ steps.build_plugin.outputs.version }}`
+            - **Nhánh / Ref:** `${{ inputs.iris_ref || 'master' }}`
+            - **Commit gốc:** [`${{ steps.build_plugin.outputs.full_sha }}`](https://github.com/VolmitSoftware/Iris/commit/${{ steps.build_plugin.outputs.full_sha }})
+          files: |
+            build/libs/*.jar
+            !build/libs/*-plain.jar
+            !build/libs/*-dev.jar
+            !build/libs/*-sources.jar
+            !build/libs/*-javadoc.jar
